@@ -368,6 +368,7 @@ class Dataset(torch.utils.data.Dataset):
         self.past_src = past_src_data
         self._type = data_type
         self.src_align_right = src_align_right
+        self.verbose = verbose
         if self.src_align_right and verbose:
             print("* Source sentences aligned to the right side.")
         self.tgt_align_right = tgt_align_right
@@ -521,9 +522,10 @@ class Dataset(torch.utils.data.Dataset):
             self.batch_tgt_sizes = [max([self.tgt_sizes[x] for x in b]) for b in self.batches]
         else:
             self.batch_tgt_sizes = [0 for b in self.batches]
-        print("Number of sentences before cleaning and sorting: %d" % len(self.src_sizes) )
-        print("Number of sentences after cleaning and sorting: %d" % sum(self.batch_sizes) )
-        print("Number of batches after cleaning and sorting: %d" % self.num_batches)
+        if self.verbose:
+            print("Number of sentences before cleaning and sorting: %d" % len(self.src_sizes) )
+            print("Number of sentences after cleaning and sorting: %d" % sum(self.batch_sizes) )
+            print("Number of batches after cleaning and sorting: %d" % self.num_batches)
 
         self.cur_index = 0
         self.batchOrder = None

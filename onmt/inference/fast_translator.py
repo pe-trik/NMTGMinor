@@ -314,12 +314,12 @@ class FastTranslator(Translator):
             self.bos_id = self.tgt_dict.labelToIdx[self.bos_token]
             print("[INFO] New Bos Token: %s Bos_ID: %d" % (self.bos_token, self.bos_id))
 
-    def translate_batch(self, batches, sub_batches=None, prefix_tokens=None,ctc_policy_hypothesis=None):
+    def translate_batch(self, batches, sub_batches=None, prefix_tokens=None,ctc_policy_hypothesis=None,beam_search_filtering=False):
 
         with torch.no_grad():
-            return self._translate_batch(batches, sub_batches=sub_batches, prefix_tokens=prefix_tokens,ctc_policy_hypothesis=ctc_policy_hypothesis)
+            return self._translate_batch(batches, sub_batches=sub_batches, prefix_tokens=prefix_tokens,ctc_policy_hypothesis=ctc_policy_hypothesis,beam_search_filtering=beam_search_filtering)
 
-    def _translate_batch(self, batches, sub_batches, prefix_tokens=None,ctc_policy_hypothesis=None):
+    def _translate_batch(self, batches, sub_batches, prefix_tokens=None,ctc_policy_hypothesis=None,beam_search_filtering=False):
         batch = batches[0]
         # Batch size is in different location depending on data.
 
@@ -388,6 +388,10 @@ class FastTranslator(Translator):
 
         # helper function for allocating buffers on the fly
         buffers = {}
+        
+        ctc_hypotheses = None
+        if ctc_policy_hypothesis is not None:
+            ctc_hypotheses = [ctc_policy_hypothesis.copy() for _ in range(tokens.shape[0])]
 
         def buffer(name, type_of=tokens):  # noqa
             if name not in buffers:
@@ -424,9 +428,9 @@ class FastTranslator(Translator):
             # clone relevant token and attention tensors
             tokens_clone = tokens.index_select(0, bbsz_idx)
             tokens_clone = tokens_clone[:, 1:step + 2]  # skip the first index, which is EOS
-            assert not tokens_clone.eq(self.tgt_eos).any() or ctc_policy_hypothesis is not None
             tokens_clone[:, step] = self.tgt_eos
             attn_clone = attn.index_select(0, bbsz_idx)[:, :, 1:step + 2] if attn is not None else None
+            ctc_hypotheses_clone = [ctc_hypotheses[idx].copy() for idx in bbsz_idx.cpu().tolist()] if ctc_hypotheses is not None else None
 
             # compute scores per token position
             pos_scores = scores.index_select(0, bbsz_idx)[:, :step + 1]
@@ -463,13 +467,17 @@ class FastTranslator(Translator):
                         hypo_attn = attn_clone[i]
                     else:
                         hypo_attn = None
-
+                    ctc_hypothesis = None
+                    if ctc_hypotheses_clone is not None:
+                        ctc_hypothesis = ctc_hypotheses_clone[i]
+                        ctc_hypothesis.append_tokens(tokens_clone[i,:-1])
                     return {
                         'tokens': tokens_clone[i],
                         'score': score,
                         'attention': hypo_attn,  # src_len x tgt_len
                         'alignment': None,
                         'positional_scores': pos_scores[i],
+                        'ctc_hypothesis': ctc_hypothesis,
                     }
 
                 if len(finalized[sent]) < beam_size:
@@ -522,11 +530,6 @@ class FastTranslator(Translator):
         else:
             step = 0
 
-        ctc_hypotheses = None
-        logging.info(f'Using CTC policy: {ctc_policy_hypothesis is not None}')
-        if ctc_policy_hypothesis is not None:
-            ctc_hypotheses = [ctc_policy_hypothesis] + [ctc_policy_hypothesis.copy() for _ in range(beam_size - 1)]
-        align_time, copy_time = 0, 0
         # step = 0 if (prefix_tokens is None and bsz == 1) else prefix_tokens.size(1) - 1
         # for step in range(max_len + 1):  # one extra step for EOS marker
         while step < (max_len + 1):
@@ -542,12 +545,8 @@ class FastTranslator(Translator):
                     sub_decoder_states[i]._reorder_incremental_state(reorder_state)
 
             if ctc_hypotheses is not None:
-                align_start = time.time()
-                ctc_hypotheses[0].append_tokens(tokens[0, :step + 1])
-                align_time += time.time() - align_start
-                
-                if ctc_hypotheses[0].is_finished():
-                    logging.info(f'CTC finished using {align_time} sec for align and {copy_time} for copying: {ctc_hypotheses[0].recv_tokens}')
+                for idx, ctc_hypothesis in enumerate(ctc_hypotheses[:1]):
+                    ctc_hypothesis.append_tokens(tokens[idx, 1:step + 1])
 
             decode_input = tokens[:, :step + 1]
             # print(batches[0].get('source'))
@@ -662,6 +661,11 @@ class FastTranslator(Translator):
 
             # finalize hypotheses that end in eos (except for blacklisted ones)
             eos_mask = cand_indices.eq(self.tgt_eos)
+
+            if beam_search_filtering and eos_mask.any():
+                eos_idx = torch.argmax((cand_indices - self.tgt_eos).abs(), dim=1, keepdim=False)
+                eos_mask[:, eos_idx:] = True
+                cand_indices[:, eos_idx:] = self.tgt_eos
             eos_mask[:, :beam_size][blacklist] = 0
 
             # only consider eos when it's among the top beam_size indices
@@ -789,9 +793,8 @@ class FastTranslator(Translator):
 
             
             if ctc_hypotheses is not None:
-                copy_time_start = time.time()
                 used = set()
-                new_ctc_hypotheses = ctc_hypotheses
+                new_ctc_hypotheses = []
                 for idx in active_bbsz_idx.cpu().numpy():
                     h = ctc_hypotheses[idx]
                     if idx in used:
@@ -799,7 +802,6 @@ class FastTranslator(Translator):
                     new_ctc_hypotheses.append(h)
                     used.add(idx)
                 ctc_hypotheses = new_ctc_hypotheses
-                copy_time += time.time() - copy_time_start
 
             # reorder incremental state in decoder
             reorder_state = active_bbsz_idx
@@ -1000,7 +1002,7 @@ class FastTranslator(Translator):
                             src_align_right=self.opt.src_align_right,
                             past_src_data=past_src_data)
 
-    def translate(self, src_data, tgt_data, past_src_data=None, sub_src_data=None, type='mt', prefix=None,ctc_policy_hypothesis=None):
+    def translate(self, src_data, tgt_data, past_src_data=None, sub_src_data=None, type='mt', prefix=None,ctc_policy_hypothesis=None,beam_search_filtering=False):
 
         if past_src_data is None or len(past_src_data) == 0:
             past_src_data = None
@@ -1046,7 +1048,7 @@ class FastTranslator(Translator):
         #  (2) translate
         #  each model in the ensemble uses one batch in batches
         finalized, gold_score, gold_words, allgold_words = self.translate_batch(batches, sub_batches=sub_batches,
-                                                                                prefix_tokens=prefix_tensor,ctc_policy_hypothesis=ctc_policy_hypothesis)
+                                                                                prefix_tokens=prefix_tensor,ctc_policy_hypothesis=ctc_policy_hypothesis,beam_search_filtering=beam_search_filtering)
         pred_length = []
 
         #  (3) convert indexes to words
@@ -1082,4 +1084,4 @@ class FastTranslator(Translator):
                      for n in range(self.opt.n_best)]
                 )
 
-        return pred_batch, pred_ids, pred_score, pred_length, gold_score, gold_words, allgold_words
+        return pred_batch, pred_ids, pred_score, pred_length, gold_score, gold_words, allgold_words, finalized[0][0]['ctc_hypothesis']

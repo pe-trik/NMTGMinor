@@ -7,7 +7,6 @@
 import os
 import copy
 
-from NMTGMinor.translate_api import add_parser_args, TranlateAPI
 
 from simuleval.utils import entrypoint
 from simuleval.agents.actions import ReadAction, WriteAction
@@ -21,13 +20,12 @@ BOW_PREFIX = "\u2581"
 CAPITALIZING_PUNCTUATION = set(".!?")
 PUNCTUATION = set(".!?,;')")
 
-import torch
 import logging
 
-from tools.simuleval_agent23 import IWSLT23Agent
+from tools.simuleval_agent23_base import IWSLT23AgentBase
 
 @entrypoint
-class IWSLT23AgentCTCPolicy(IWSLT23Agent):
+class IWSLT23AgentCTCPolicy(IWSLT23AgentBase):
 
     def __init__(self, args):
         super().__init__(args)
@@ -66,6 +64,8 @@ class IWSLT23AgentCTCPolicy(IWSLT23Agent):
                     )
         self.speech2text = Speech2TextStreaming(**speech2text_kwargs)
         os.chdir(org_cwd)
+        Bart2EspNetHypo.ctc_hold_last_word = args.ctc_hold_last_word
+        Bart2EspNetHypo.ctc_dont_wait_for_whole_word = args.ctc_dont_wait_for_whole_word or self.chinese
         Bart2EspNetHypo.decoder = self.speech2text.beam_search
         Bart2EspNetHypo.smp = self.speech2text.sentence_piece
         Bart2EspNetHypo.dic = self.dic
@@ -73,7 +73,9 @@ class IWSLT23AgentCTCPolicy(IWSLT23Agent):
 
     @staticmethod
     def add_args(parser):
-        IWSLT23Agent.add_args(parser)
+        IWSLT23AgentBase.add_args(parser)
+        parser.add_argument('--ctc_hold_last_word', action='store_true')
+        parser.add_argument('--ctc_dont_wait_for_whole_word', action='store_true')
         parser.add_argument('--espnet_recipe_path', type=str, required=True)
         parser = IWSLT23AgentCTCPolicy.add_espnet_args(parser)
         return parser
@@ -88,6 +90,7 @@ class IWSLT23AgentCTCPolicy(IWSLT23Agent):
         self.capitalize = True
         if hasattr(self, 'speech2text') and self.speech2text is not None:
             self.speech2text.reset()
+            self.ctc_policy_hypothesis = None
 
     def policy(self):
         if self._can_process():
@@ -97,7 +100,7 @@ class IWSLT23AgentCTCPolicy(IWSLT23Agent):
 
             if h is not None:
                 logging.info(f'HYPO:   {self.model.decode(h)}')
-                stable = self._policy(h)
+                stable = h
                 logging.info(f'STABLE: {self.model.decode(stable)}')
                 output = self._detokenize(stable)
                 self.output = ' '.join([self.output, output])
@@ -117,10 +120,19 @@ class IWSLT23AgentCTCPolicy(IWSLT23Agent):
             prefix = None
             if len(self.stable) > 0:
                 prefix = [self.stable]
-            ctc_policy_hypothesis = None if self.states.source_finished else Bart2EspNetHypo()
-            hypotheses = self.model.infer(src, prefix, ctc_policy_hypothesis=ctc_policy_hypothesis)
-            hypothesis = hypotheses[0][0] # Tensor: T (no BOS + prefix)
-            return list(hypothesis.cpu().numpy())
+            if self.states.source_finished:
+                self.ctc_policy_hypothesis = None
+            elif self.ctc_policy_hypothesis is None:
+                self.ctc_policy_hypothesis = Bart2EspNetHypo()
+            else:
+                self.ctc_policy_hypothesis.extend()
+            hypotheses, self.ctc_policy_hypothesis = self.model.infer(src, prefix, ctc_policy_hypothesis=self.ctc_policy_hypothesis, beam_search_filtering=self.beam_search_filtering and not self.states.source_finished)
+            if self.ctc_policy_hypothesis is not None:
+                hypothesis = list(self.ctc_policy_hypothesis.original_tokens)
+                self.ctc_policy_hypothesis.finished = False
+            else:
+                hypothesis = list(hypotheses[0][0][:-1].cpu().numpy()) # Tensor: T (no BOS + prefix)
+            return hypothesis
         return None
     
     @staticmethod
@@ -402,51 +414,58 @@ class Bart2EspNetHypo:
     dic = None
     smp = None
     decoder : BatchBeamSearchOnline = None
+    ctc_hold_last_word = False
+    ctc_dont_wait_for_whole_word = False
 
-    def __init__(self,tokens=None, word=None, force_decoded=0, h=None, finished=False, score=0., orginal_tokens=0,recv_tokens=None,eos_scores=None,last_appended=1):
-        self.tokens = copy.deepcopy(tokens) if tokens else []
-        self.word = copy.deepcopy(word) if word else ''
-        self.force_decoded = force_decoded
-        if h is None:
+    def __init__(self,original_tokens=None,ctc_tokens=None,hypothesis=None,finished=False,score=0):
+        self.original_tokens = self._copy(original_tokens, [])
+        self.ctc_tokens = self._copy(ctc_tokens, [])
+        if hypothesis is None:
             self.hypothesis = self.decoder.init_hyp(self.decoder.enc_for_ctc_policy)
         else:
-            self.hypothesis = copy.deepcopy(h)
+            self.hypothesis = copy.deepcopy(hypothesis)
         self.finished = finished
-        self.score = score
-        self.orginal_tokens = orginal_tokens
-        self.recv_tokens = copy.deepcopy(recv_tokens) if recv_tokens else ''
-        self.eos_scores = copy.deepcopy(eos_scores) if eos_scores else []
-        self.last_appended = last_appended
+        self.score = 0
+
+    @classmethod
+    def _copy(self, item, new_value):
+        return copy.deepcopy(item) if item else new_value
+
+    def extend(self):
+        self.decoder.extend(self.decoder.enc_for_ctc_policy, self.hypothesis)
+
+    def print_original(self):
+        return ''.join(self.dic[t] for t in self.original_tokens)
 
     def copy(self):
         return Bart2EspNetHypo(
-            self.tokens,
-            self.word,
-            self.force_decoded,
-            self.hypothesis,
-            self.finished,
-            self.score,
-            self.orginal_tokens,
-            self.recv_tokens,
-            self.eos_scores,
-            self.last_appended,
+            original_tokens=self.original_tokens,
+            ctc_tokens=self.ctc_tokens,
+            finished=self.finished,
+            hypothesis=self.hypothesis,
+            score=self.score,
         )
 
     def append_tokens(self, tokens):
-        for token in tokens[self.last_appended:].cpu().numpy():
-            token = self.dic[token]
-            if token.startswith('▁') and len(self.word) > 1:
-                self.tokens += self.smp.EncodeAsIds(self.word)
-                self.recv_tokens += ''.join(self.smp.EncodeAsPieces(self.word))
-                self.word = ''
-                self.hypothesis, finished, eos_scores = self.decoder._ctc_force_decode_tokens(self.hypothesis, self.tokens, self.force_decoded, len(self.tokens))
-                self.finished |= finished
-                self.force_decoded = len(self.tokens)
-                self.orginal_tokens = 0
-                self.eos_scores += eos_scores
-            self.orginal_tokens += 1
-            self.word += token
-        self.last_appended = tokens.shape[0]
+        new_tokens = tokens[len(self.original_tokens):].cpu().tolist()
+        valid_pos = 0
+        if not self.ctc_dont_wait_for_whole_word:
+            for pos, token in enumerate(new_tokens):
+                token = self.dic[token]
+                if token.startswith('▁'):
+                    valid_pos = pos
+        else:
+            valid_pos = len(new_tokens)
+        new_tokens = new_tokens[:valid_pos]
+        if len(new_tokens) > 0:
+            new_text = ''.join(self.dic[t] for t in new_tokens)
+            new_ctc_tokens = self.ctc_tokens + self.smp.EncodeAsIds(new_text)
+            self.hypothesis, finished, score = self.decoder._ctc_force_decode_tokens(self.hypothesis, new_ctc_tokens, len(self.ctc_tokens), len(new_ctc_tokens))
+            self.finished |= finished
+            if not self.finished or not self.ctc_hold_last_word: 
+                self.original_tokens += new_tokens
+                self.ctc_tokens = new_ctc_tokens    
+                self.score += score        
     
     def is_finished(self):
         return self.finished
