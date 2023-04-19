@@ -1,13 +1,14 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 from __future__ import division
+import logging
 
 import onmt.markdown
 import torch
 import argparse
 import math
 import numpy as np
-from onmt.inference.fast_translator_fast_prefix import FastTranslatorFastPrefix
+from onmt.inference.fast_translator import FastTranslator
 
 def add_parser_args(parser):
     parser.add_argument('-model', required=True,
@@ -177,9 +178,9 @@ class TranlateAPI():
             return self.external_tokenizer.decode(tokens[0].cpu().numpy(), True, True).strip()
         return self.external_tokenizer.decode(tokens, True, True).strip()
 
-    def __init__(self, opt) -> None:
+    def __init__(self, opt, beam_search_filtering=False) -> None:
         opt.cuda = opt.gpu > -1
-        print(opt.gpu )
+        logging.info(f'Using GPU: {opt.cuda}')
         if opt.cuda:
             try:
                 torch.cuda.set_device(opt.gpu)
@@ -191,10 +192,13 @@ class TranlateAPI():
         opt.n_best = opt.beam_size
         self.opt = opt
 
-        translator = FastTranslatorFastPrefix(opt)
+        translator = FastTranslator(opt)
+        for m in translator.models:
+            m.eval()
         self.BOS = translator.tgt_bos
         self.EOS = translator.tgt_eos
-        print(self.BOS, self.EOS)
+        logging.info(f"Using BOS: {self.BOS}")
+        logging.info(f"Using EOS: {self.EOS}")
 
         if hasattr(translator, 'tgt_external_tokenizer'):
             external_tokenizer = translator.tgt_external_tokenizer
@@ -203,11 +207,12 @@ class TranlateAPI():
 
         self.translator = translator
         self.external_tokenizer = external_tokenizer
+        self.beam_search_filtering = beam_search_filtering
 
     def dict(self):
         return self.translator.tgt_dict.idxToLabel
         
-    def infer(self, src, prefix, itype='fbank', return_contributions=False):
+    def infer(self, src, prefix, itype='wav', ctc_policy_hypothesis=None,beam_search_filtering=False):
         opt = self.opt
         translator = self.translator
 
@@ -289,7 +294,7 @@ class TranlateAPI():
                 tgt_batch,
                 past_src_data=past_src_batches,
                 sub_src_data=sub_src_batch,
-                type='asr', prefix=prefix, return_contributions=return_contributions)
+                type='asr', prefix=prefix,ctc_policy_hypothesis=ctc_policy_hypothesis)
             return pred_ids
 
         elif itype == 'wav':
@@ -310,9 +315,9 @@ class TranlateAPI():
                 src_batches[j].append(line)
 
             pred_batch, pred_ids, pred_score, pred_length, \
-            gold_score, num_gold_words, all_gold_scores = translator.translate(
+            gold_score, num_gold_words, all_gold_scores, ctc_hypothesis = translator.translate(
                 src_batches,
                 tgt_batch,
                 past_src_data=[],
-                sub_src_data=[], type='asr', prefix=prefix)
-            return pred_ids, pred_score
+                sub_src_data=[], type='asr', prefix=prefix,ctc_policy_hypothesis=ctc_policy_hypothesis,beam_search_filtering=beam_search_filtering)
+            return pred_ids, ctc_hypothesis
